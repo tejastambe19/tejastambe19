@@ -1,0 +1,324 @@
+PSEUDO CODE: VBA Rule Processing System
+==========================================
+
+MAIN PROGRAM FLOW:
+------------------
+
+PROCEDURE ProcessMultipleWorkbooks():
+    1. GET user inputs from form:
+       - instanceName = form.txtInstanceName.value
+       - jwtToken = form.txtToken.value
+       - contractType = "ICMStandaloneAgreement"
+    
+    2. OPEN file dialog:
+       - allowMultiSelect = false
+       - filter = "Excel Files (*.xls, *.xlsx, *.xlsm)"
+       - IF user cancels THEN exit
+    
+    3. OPEN selected Excel workbook
+    
+    4. FOR EACH worksheet IN workbook:
+       IF worksheet.name != "Lookups" THEN:
+           a. jsonBody = GenerateClauseAssemblyJSONUnified(workbook)
+           b. CALL SendClauseAssemblyRequest(jsonBody, instanceName, contractType, jwtToken, workbook, worksheet.name)
+    
+    5. SAVE and CLOSE workbook
+END PROCEDURE
+
+CORE PROCESSING FUNCTIONS:
+--------------------------
+
+FUNCTION GenerateClauseAssemblyJSONUnified(workbook) RETURNS String:
+    1. INITIALIZE:
+       - rules = empty collection
+       - subRuleCount = 0
+       - mainRuleName = ""
+    
+    2. FOR EACH worksheet IN workbook:
+       IF worksheet.name != "Lookups" THEN:
+           a. sheetRules = ProcessSheet(worksheet, mainRuleName)
+           b. FOR EACH rule IN sheetRules:
+              - ADD rule TO rules collection
+              - INCREMENT subRuleCount
+    
+    3. ruleSet = BuildRuleSet(rules, mainRuleName)
+    4. RETURN JsonConverter.ConvertToJson(ruleSet)
+END FUNCTION
+
+FUNCTION ProcessSheet(worksheet, mainRuleName) RETURNS Collection:
+    1. INITIALIZE:
+       - rules = new collection
+       - i = 1
+       - CTNameFound = false
+       - mainRuleFound = false
+    
+    2. SCAN header section (rows 1-10):
+       FOR i = 1 TO 10:
+           IF cell(i,1) = "Contract Type Name" THEN:
+               contractType = cell(i,2)
+               CTNameFound = true
+           IF cell(i,1) = "Main Rule Name" OR cell(i,1) = "Rule Name" THEN:
+               mainRuleName = cell(i,2)
+               mainRuleFound = true
+           IF CTNameFound AND mainRuleFound THEN break
+    
+    3. SCAN for multiple sub-rules:
+       i = 1
+       WHILE i <= worksheet.usedRange.rows.count:
+           IF cell(i,2) = "Sub-Rule Name" OR cell(i,2) = "Sub-Rule" THEN:
+               
+               a. EXTRACT sub-rule name:
+                  subRuleName = EscapeJSON(cell(i,3))
+                  INCREMENT i
+               
+               b. PROCESS condition (if exists):
+                  IF cell(i,2) = "Condition" THEN:
+                      conditionText = cell(i,3)
+                      expressions = BuildExpressionsAdvanced(conditionText)
+                      INCREMENT i
+                  ELSE:
+                      expressions = empty dictionary
+               
+               c. SKIP "Select action" header:
+                  IF cell(i,2) = "Select action" THEN INCREMENT i
+               
+               d. PROCESS actions for this sub-rule:
+                  actions = new collection
+                  WHILE i <= worksheet.usedRange.rows.count:
+                      IF cell(i,2) = "" THEN:
+                          INCREMENT i
+                          CONTINUE
+                      IF cell(i,2) = "Sub-Rule Name" OR cell(i,2) = "Sub-Rule" THEN:
+                          BREAK  // Found next sub-rule, stop processing current one
+                      
+                      action = BuildAction(worksheet, i)
+                      ADD action TO actions collection
+                      INCREMENT i
+               
+               e. CREATE rule dictionary:
+                  ruleDict = new dictionary
+                  ruleDict("ConditionGroups") = array(expressions)
+                  ruleDict("Actions") = CollectionToArray(actions)
+                  ruleDict("Id") = 1
+                  ruleDict("Name") = subRuleName
+                  ruleDict("StopProcessingMoreRules") = false
+                  ruleDict("IsActive") = true
+               
+               f. ADD ruleDict TO rules collection
+           
+           INCREMENT i
+    
+    4. RETURN rules collection
+END FUNCTION
+
+CONDITION PARSING SYSTEM:
+------------------------
+
+FUNCTION BuildExpressionsAdvanced(conditionText) RETURNS Object:
+    1. tokens = TokenizeCondition(conditionText)
+    2. index = 0
+    3. RETURN ParseLogicalGroup(tokens, index)
+END FUNCTION
+
+FUNCTION TokenizeCondition(conditionText) RETURNS Array:
+    1. temp = conditionText
+    2. REPLACE "(" WITH " ( "
+    3. REPLACE ")" WITH " ) "
+    4. REPLACE " and " WITH " AND "
+    5. REPLACE " or " WITH " OR "
+    6. RETURN Split(temp)
+END FUNCTION
+
+FUNCTION ParseLogicalGroup(tokens, index) RETURNS Object:
+    1. INITIALIZE group dictionary:
+       - LogicalOperator = "AND"
+       - Expressions = empty array
+       - ConditionGroups = empty array
+    
+    2. expressions = new collection
+    
+    3. WHILE index <= tokens.upperBound:
+       token = Trim(tokens[index])
+       
+       IF token = "(" THEN:
+           INCREMENT index
+           nestedGroup = ParseLogicalGroup(tokens, index)  // Recursive call
+           ADD nestedGroup TO group.ConditionGroups
+       
+       ELSE IF token = ")" THEN:
+           BREAK
+       
+       ELSE IF token = "AND" OR token = "OR" THEN:
+           group.LogicalOperator = token
+       
+       ELSE:
+           // Build expression text
+           exprText = token
+           WHILE index+1 <= tokens.upperBound:
+               IF tokens[index+1] IN ["AND", "OR", "(", ")"] THEN BREAK
+               INCREMENT index
+               exprText = exprText + " " + tokens[index]
+           
+           expr = ParseSimpleExpression(exprText)
+           IF expr IS NOT NULL THEN ADD expr TO expressions
+       
+       INCREMENT index
+    
+    4. IF expressions.count > 0 THEN:
+       group.Expressions = CollectionToArray(expressions)
+    
+    5. IF expressions.count = 0 AND group.ConditionGroups has only 1 item THEN:
+       RETURN group.ConditionGroups[0]  // Flatten single nested group
+    ELSE:
+       RETURN group
+END FUNCTION
+
+FUNCTION ParseSimpleExpression(exprText) RETURNS Object:
+    1. parts = Split(exprText, "=")
+    2. IF parts.count != 2 THEN RETURN NULL
+    
+    3. CREATE expression dictionary:
+       - Attribute = CleanText(parts[0])
+       - Operator = "Eq"
+       - Value = CleanText(parts[1])
+       - AggregationType = null
+       - Selection = null
+    
+    4. RETURN expression
+END FUNCTION
+
+ACTION BUILDING:
+---------------
+
+FUNCTION BuildAction(worksheet, rowIndex) RETURNS Object:
+    1. EXTRACT action data from row:
+       - actionType = IF cell(rowIndex,2) LIKE "*Placeholder*" THEN "SelectPlaceholderClause" ELSE "SelectClause"
+       - placeholderClause = EscapeJSON(cell(rowIndex,3))
+       - clauseType = EscapeJSON(cell(rowIndex,4))
+       - subClause = EscapeJSON(cell(rowIndex,5))
+       - sequence = cell(rowIndex,6) OR null if empty
+       - clauseName = IF actionType = "SelectClause" THEN subClause ELSE ""
+    
+    2. CREATE action dictionary:
+       - ActionType = actionType
+       - ClauseName = clauseName
+       - ConditionGroups = empty array
+       - PlaceholderClause = IF actionType = "SelectPlaceholderClause" THEN placeholderClause ELSE ""
+       - ClauseType = clauseType
+       - SubClause = IF actionType = "SelectPlaceholderClause" THEN subClause ELSE ""
+       - Sequence = sequence
+    
+    3. RETURN action
+END FUNCTION
+
+API COMMUNICATION:
+-----------------
+
+PROCEDURE SendClauseAssemblyRequest(jsonBody, instanceName, contractType, jwtToken, workbook, worksheetName, mainRuleName, subRuleCount):
+    1. SETUP HTTP request:
+       - url = "https://" + instanceName + "-business-api.icertis.com/api/v1/ruleset/" + contractType + "/Clauseassembly"
+       - http = new XMLHTTP object
+    
+    2. SEND request:
+       startTime = Timer
+       OPEN POST request to url
+       SET header "ICMAuthToken" = jwtToken
+       SET header "Content-Type" = "application/json"
+       SEND jsonBody
+       statusCode = response.status
+       responseText = response.text
+       endTime = Timer
+    
+    3. CALCULATE execution metrics:
+       timeTaken = Round(endTime - startTime, 2)
+       executionTime = Format(Now, "yyyy-mm-dd HH:MM:SS")
+    
+    4. LOG results:
+       logFilePath = workbook.path + "\Execution_Log.xlsx"
+       
+       TRY OPEN existing log file:
+           IF log file doesn't exist THEN:
+               CREATE new log file
+               ADD headers: ["CT", "Main Rule", "# of sub-rules", "Execution Status", "Error Description", "Execution Time", "Time Taken (s)", "JSON"]
+       
+       FIND next empty row
+       WRITE log entry:
+           - worksheetName
+           - mainRuleName
+           - subRuleCount
+           - GetStatusMessage(statusCode)
+           - responseText
+           - executionTime
+           - timeTaken
+           - jsonBody
+       
+       SAVE and CLOSE log file
+
+    5. ERROR HANDLING:
+       IF HTTP error occurs THEN:
+           SHOW error message
+           LOG error to debug
+END PROCEDURE
+
+UTILITY FUNCTIONS:
+-----------------
+
+FUNCTION GetStatusMessage(statusCode) RETURNS String:
+    CASE statusCode:
+        200: RETURN "Success (200)"
+        201: RETURN "Created (201)"
+        400: RETURN "Bad Request (400)"
+        401: RETURN "Unauthorized (401)"
+        404: RETURN "Not Found (404)"
+        500: RETURN "Server Error (500)"
+        DEFAULT: RETURN "Unexpected status code (" + statusCode + ")"
+END FUNCTION
+
+FUNCTION EscapeJSON(text) RETURNS String:
+    IF text IS NULL OR EMPTY THEN RETURN ""
+    temp = ToString(text)
+    REPLACE "\" WITH "\\"
+    REPLACE '"' WITH '\"'
+    REPLACE newlines WITH "\n"
+    RETURN temp
+END FUNCTION
+
+FUNCTION CleanText(inputText) RETURNS String:
+    USE regex to remove leading whitespace
+    USE regex to remove trailing whitespace
+    RETURN cleaned text
+END FUNCTION
+
+FUNCTION CollectionToArray(collection) RETURNS Array:
+    IF collection.count = 0 THEN RETURN empty array
+    CREATE array[0 to collection.count-1]
+    FOR i = 1 TO collection.count:
+        array[i-1] = collection[i]
+    RETURN array
+END FUNCTION
+
+KEY FEATURES FOR MULTIPLE SUB-RULES:
+-----------------------------------
+
+1. SEQUENTIAL PROCESSING: The program scans through the entire worksheet sequentially
+2. SUB-RULE DETECTION: Identifies each "Sub-Rule Name" or "Sub-Rule" as start of new sub-rule
+3. ACTION BOUNDARY DETECTION: Stops processing actions when it encounters next sub-rule
+4. COLLECTION AGGREGATION: All sub-rules from a sheet are collected into single rules collection
+5. SHARED METADATA: All sub-rules in a sheet share the same main rule name and contract type
+6. INDIVIDUAL PROCESSING: Each sub-rule gets its own conditions and actions processed independently
+
+WORKFLOW SUMMARY:
+1. User selects Excel file via dialog
+2. Program opens workbook
+3. For each non-"Lookups" worksheet:
+   a. Extract header information (contract type, main rule name)
+   b. Scan for multiple sub-rules in sequence
+   c. For each sub-rule found:
+      - Extract sub-rule name
+      - Parse conditions (if any)
+      - Collect all actions until next sub-rule or end of sheet
+      - Create rule object
+   d. Combine all sub-rules into single JSON structure
+   e. Send to API
+   f. Log results
+4. Save and close workbook
